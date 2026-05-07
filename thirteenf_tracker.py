@@ -111,4 +111,89 @@ def get_previous_holdings(cik):
     accessions = recent.get("accessionNumber", [])
     prev_13fs  = [acc for form, acc in zip(forms, accessions) if form == "13F-HR"]
     if len(prev_13fs) < 2:
-      
+        return {}
+    acc = prev_13fs[1]
+    acc_clean = acc.replace("-", "")
+    base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_clean}"
+    jr = requests.get(f"{base}/{acc}-index.json", headers=HEADERS, timeout=10)
+    if jr.status_code != 200:
+        return {}
+    _, infotable = find_xml_docs(jr.json(), base)
+    return parse_holdings(infotable) if infotable else {}
+
+def compare(current, previous):
+    new, increased, exited = [], [], []
+    for cusip, d in current.items():
+        if cusip not in previous:
+            new.append(d | {"cusip": cusip})
+        elif current[cusip]["value"] > previous[cusip]["value"] > 0:
+            pct = (current[cusip]["value"] - previous[cusip]["value"]) / previous[cusip]["value"] * 100
+            increased.append(d | {"cusip": cusip, "pct": pct, "prev": previous[cusip]["value"]})
+    for cusip, d in previous.items():
+        if cusip not in current:
+            exited.append(d)
+    new.sort(key=lambda x: x["value"], reverse=True)
+    increased.sort(key=lambda x: x["pct"], reverse=True)
+    return new[:5], increased[:5], exited
+
+def format_block(fund_name, new, increased, exited, total_new):
+    lines = [f"*{fund_name}*  |  ${total_new / 1_000:.1f}M in new positions"]
+    if new:
+        lines.append("  *New positions (top 5):*")
+        for p in new:
+            lines.append(f"    • {p['name']} — ${p['value'] / 1_000:.1f}M")
+    if increased:
+        lines.append("  *Most increased (top 5):*")
+        for p in increased:
+            lines.append(f"    • {p['name']} +{p['pct']:.0f}%  (${p['prev']/1_000:.1f}M → ${p['value']/1_000:.1f}M)")
+    if exited:
+        names = ", ".join(p["name"] for p in exited[:5])
+        more  = f" +{len(exited)-5} more" if len(exited) > 5 else ""
+        lines.append(f"  *Exited:* {names}{more}")
+    return "\n".join(lines)
+
+def post_to_slack(msg):
+    requests.post(SLACK_WEBHOOK, json={"text": msg}, timeout=10)
+
+print("Fetching recent 13F-HR filings...")
+filing_urls = get_recent_filings(days=7)
+print(f"Found {len(filing_urls)} filings in the last 7 days")
+
+results = []
+for url in filing_urls:
+    try:
+        idx = get_index(url)
+        if not idx:
+            continue
+        base = "/".join(url.split("/")[:-1])
+        cik  = url.split("/")[-3].lstrip("0")
+        primary, infotable = find_xml_docs(idx, base)
+        if not primary:
+            continue
+        fund_name, total_value = parse_cover(primary)
+        if total_value < AUM_THRESHOLD:
+            print(f"Skip {fund_name} — ${total_value/1_000:.0f}M AUM")
+            continue
+        print(f"Processing {fund_name} (${total_value/1_000:.0f}M)...")
+        if not infotable:
+            continue
+        current  = parse_holdings(infotable)
+        previous = get_previous_holdings(cik)
+        new, increased, exited = compare(current, previous)
+        total_new = sum(p["value"] for p in new)
+        results.append({"name": fund_name, "total_new": total_new,
+                        "new": new, "increased": increased, "exited": exited})
+        time.sleep(0.3)
+    except Exception as e:
+        print(f"Error on {url}: {e}")
+
+results.sort(key=lambda x: x["total_new"], reverse=True)
+
+if not results:
+    post_to_slack(f"*13F-HR Monitor — {date.today()}*\nNo qualifying funds (>$1B AUM) filed in the last 7 days.")
+else:
+    blocks = [f"*:bank: 13F Institutional Holdings — {date.today()}*\n_{len(results)} funds >$1B AUM filed this week_\n"]
+    for r in results[:10]:
+        blocks.append(format_block(r["name"], r["new"], r["increased"], r["exited"], r["total_new"]))
+    post_to_slack("\n\n---\n\n".join(blocks))
+    print(f"Posted {len(results)} funds to Slack.")
